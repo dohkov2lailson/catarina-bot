@@ -1,14 +1,14 @@
 import os
 import logging
-import anthropic
+import requests
+import json
+import base64
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
 from telegram.constants import ParseMode, ChatAction
-import io
-import base64
 
 # ─── CONFIG ───
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
@@ -98,17 +98,17 @@ def get_state(user_id):
         user_states[user_id] = {
             "brand": "llsquad",
             "format": None,
-            "waiting_for": None,  # "tema" | "brand_text" | None
+            "waiting_for": None,
             "custom_brand": "",
-            "history": []  # conversation memory per user
+            "_pending_tema": "",
+            "_pending_images": None,
+            "_pending_pdf": None,
         }
     return user_states[user_id]
 
 
-# ─── ANTHROPIC CALL ───
-async def call_catarina(user_message: str, brand_key: str, format_key: str, custom_brand: str = "", images: list = None, pdf_data: bytes = None):
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
+# ─── ANTHROPIC CALL VIA REQUESTS (no SDK) ───
+def call_catarina(user_message, brand_key, format_key, custom_brand="", images=None, pdf_data=None):
     brand_prompt = ""
     if brand_key == "custom" and custom_brand:
         brand_prompt = f"\n\nIDENTIDADE DA MARCA:\n{custom_brand}"
@@ -120,7 +120,6 @@ async def call_catarina(user_message: str, brand_key: str, format_key: str, cust
     # Build content
     content = []
 
-    # Images
     if images:
         for img in images:
             content.append({
@@ -132,7 +131,6 @@ async def call_catarina(user_message: str, brand_key: str, format_key: str, cust
                 }
             })
 
-    # PDF
     if pdf_data:
         pdf_b64 = base64.b64encode(pdf_data).decode("utf-8")
         content.append({
@@ -144,18 +142,39 @@ async def call_catarina(user_message: str, brand_key: str, format_key: str, cust
             }
         })
 
-    # Text
     full_text = f"{brand_prompt}\n\nFormato solicitado: {format_label}\n\n{user_message}"
     content.append({"type": "text", "text": full_text})
 
-    message = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4000,
-        system=CATARINA_SYSTEM,
-        messages=[{"role": "user", "content": content}]
+    payload = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 4000,
+        "system": CATARINA_SYSTEM,
+        "messages": [{"role": "user", "content": content}]
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01"
+    }
+
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers=headers,
+        json=payload,
+        timeout=120
     )
 
-    return message.content[0].text
+    if resp.status_code != 200:
+        error_msg = resp.json().get("error", {}).get("message", resp.text[:200])
+        raise Exception(f"API error {resp.status_code}: {error_msg}")
+
+    data = resp.json()
+    text_parts = [b["text"] for b in data.get("content", []) if b.get("type") == "text"]
+    if not text_parts:
+        raise Exception("Resposta vazia da API")
+
+    return "\n".join(text_parts)
 
 
 # ─── HANDLERS ───
@@ -176,7 +195,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/criar — Criar conteúdo novo\n"
         "/marca — Trocar a marca\n"
         "/ajuda — Ver todos os comandos\n\n"
-        "Ou simplesmente me manda o tema que já começo a criar! 🚀"
+        "Ou me manda o tema direto que eu já crio! 🚀"
     )
     await update.message.reply_text(welcome, parse_mode=ParseMode.MARKDOWN)
 
@@ -228,23 +247,24 @@ async def cmd_criar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_direto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /post, /carrossel, /reels with inline tema"""
     command = update.message.text.split()[0].replace("/", "")
     tema = update.message.text.replace(f"/{command}", "").strip()
+    state = get_state(update.effective_user.id)
 
     if not tema:
-        state = get_state(update.effective_user.id)
         state["format"] = command
         state["waiting_for"] = "tema"
-        await update.message.reply_text(f"✏️ Manda o tema pro *{FORMAT_LABELS[command]}*:", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            f"✏️ Manda o tema pro *{FORMAT_LABELS[command]}*:",
+            parse_mode=ParseMode.MARKDOWN
+        )
         return
 
-    state = get_state(update.effective_user.id)
     state["format"] = command
     await gerar_conteudo(update, tema, state)
 
 
-# ─── CALLBACK (buttons) ───
+# ─── CALLBACKS ───
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -261,22 +281,57 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state["waiting_for"] = "brand_text"
             await query.edit_message_text(
                 "✨ *Marca personalizada*\n\n"
-                "Me manda as informações da marca:\n"
-                "Nome, cores, tom de voz, público-alvo, estilo visual...\n\n"
-                "Pode mandar em texto livre!",
+                "Me manda as infos da marca:\n"
+                "Nome, cores, tom de voz, público, estilo visual...",
                 parse_mode=ParseMode.MARKDOWN
             )
         else:
             brand_name = BRANDS[brand]["name"]
-            await query.edit_message_text(f"✅ Marca definida: *{brand_name}*", parse_mode=ParseMode.MARKDOWN)
+            await query.edit_message_text(
+                f"✅ Marca: *{brand_name}*\n\nAgora use /criar ou mande um tema!",
+                parse_mode=ParseMode.MARKDOWN
+            )
 
     elif data.startswith("fmt_"):
         fmt = data.replace("fmt_", "")
         state["format"] = fmt
+
+        # Check for pending data
+        if state.get("waiting_for") == "_pending" and state.get("_pending_tema"):
+            tema = state.pop("_pending_tema", "")
+            state["waiting_for"] = None
+            await query.edit_message_text(f"⚡ Gerando *{FORMAT_LABELS[fmt]}*...", parse_mode=ParseMode.MARKDOWN)
+            await gerar_conteudo(update, tema, state)
+            return
+
         state["waiting_for"] = "tema"
         await query.edit_message_text(
             f"✏️ Manda o *tema* pro {FORMAT_LABELS[fmt]}:\n\n"
-            "💡 Pode mandar texto, foto de referência ou PDF!",
+            "💡 Pode mandar texto, foto ou PDF!",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    elif data == "show_formats":
+        keyboard = [
+            [InlineKeyboardButton("📸 Post", callback_data="fmt_post")],
+            [InlineKeyboardButton("🎠 Carrossel", callback_data="fmt_carrossel")],
+            [InlineKeyboardButton("🎬 Reels", callback_data="fmt_reels")],
+        ]
+        await query.edit_message_text(
+            "🎯 *Qual formato?*",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    elif data == "show_brands":
+        keyboard = [
+            [InlineKeyboardButton("🏋️ LL Squad", callback_data="brand_llsquad")],
+            [InlineKeyboardButton("🏛️ Melliz Arquitetura", callback_data="brand_melliz")],
+            [InlineKeyboardButton("✨ Outra marca", callback_data="brand_custom")],
+        ]
+        await query.edit_message_text(
+            "🎨 *Escolha a marca:*",
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.MARKDOWN
         )
 
@@ -286,27 +341,25 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     state = get_state(user_id)
-    text = update.message.text or update.message.caption or ""
+    text = update.message.text or ""
 
-    # Custom brand text
     if state["waiting_for"] == "brand_text":
         state["custom_brand"] = text
         state["waiting_for"] = None
         await update.message.reply_text(
-            f"✅ Marca personalizada salva!\n\n"
-            "Agora use /criar ou me manda um tema direto.",
+            "✅ Marca personalizada salva!\n\nUse /criar ou mande um tema.",
             parse_mode=ParseMode.MARKDOWN
         )
         return
 
-    # Waiting for tema
     if state["waiting_for"] == "tema" and state["format"]:
         await gerar_conteudo(update, text, state)
         return
 
-    # Free message — ask format
     if text.strip():
-        state["waiting_for"] = None
+        state["_pending_tema"] = text
+        state["waiting_for"] = "_pending"
+        brand_name = BRANDS.get(state["brand"], {}).get("name", "✨ Personalizada")
         keyboard = [
             [
                 InlineKeyboardButton("📸 Post", callback_data="fmt_post"),
@@ -314,60 +367,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("🎬 Reels", callback_data="fmt_reels"),
             ]
         ]
-        # Store the tema temporarily
-        state["_pending_tema"] = text
-        brand_name = BRANDS.get(state["brand"], {}).get("name", "✨ Personalizada")
         await update.message.reply_text(
             f"💡 *Tema recebido!*\nMarca: {brand_name}\n\n🎯 Qual formato?",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.MARKDOWN
         )
-        # Modify callback to use pending tema
-        state["waiting_for"] = "_pending"
-        return
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle photo messages as visual references"""
     user_id = update.effective_user.id
     state = get_state(user_id)
 
-    # Download photo
-    photo = update.message.photo[-1]  # highest resolution
+    photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     photo_bytes = await file.download_as_bytearray()
     photo_b64 = base64.b64encode(bytes(photo_bytes)).decode("utf-8")
 
     caption = update.message.caption or ""
 
-    if not state.get("format"):
-        # Ask for format first
-        state["_pending_tema"] = caption or "Crie conteúdo baseado nesta imagem de referência"
-        state["_pending_images"] = [{"media_type": "image/jpeg", "data": photo_b64}]
-        keyboard = [
-            [
-                InlineKeyboardButton("📸 Post", callback_data="fmt_post"),
-                InlineKeyboardButton("🎠 Carrossel", callback_data="fmt_carrossel"),
-                InlineKeyboardButton("🎬 Reels", callback_data="fmt_reels"),
-            ]
-        ]
-        brand_name = BRANDS.get(state["brand"], {}).get("name", "✨ Personalizada")
-        await update.message.reply_text(
-            f"📷 *Referência visual recebida!*\nMarca: {brand_name}\n\n🎯 Qual formato?",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=ParseMode.MARKDOWN
-        )
-        state["waiting_for"] = "_pending"
-        return
+    state["_pending_tema"] = caption or "Crie conteúdo baseado nesta imagem de referência"
+    state["_pending_images"] = [{"media_type": "image/jpeg", "data": photo_b64}]
+    state["waiting_for"] = "_pending"
 
-    # Has format, generate directly
-    tema = caption or "Crie conteúdo baseado nesta imagem de referência visual"
-    images = [{"media_type": "image/jpeg", "data": photo_b64}]
-    await gerar_conteudo(update, tema, state, images=images)
+    brand_name = BRANDS.get(state["brand"], {}).get("name", "✨ Personalizada")
+    keyboard = [
+        [
+            InlineKeyboardButton("📸 Post", callback_data="fmt_post"),
+            InlineKeyboardButton("🎠 Carrossel", callback_data="fmt_carrossel"),
+            InlineKeyboardButton("🎬 Reels", callback_data="fmt_reels"),
+        ]
+    ]
+    await update.message.reply_text(
+        f"📷 *Referência recebida!*\nMarca: {brand_name}\n\n🎯 Qual formato?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle PDF uploads"""
     user_id = update.effective_user.id
     state = get_state(user_id)
     doc = update.message.document
@@ -375,7 +412,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if doc.mime_type != "application/pdf":
         await update.message.reply_text("⚠️ Envie um arquivo PDF.")
         return
-
     if doc.file_size > 10 * 1024 * 1024:
         await update.message.reply_text("⚠️ Máximo 10MB.")
         return
@@ -385,34 +421,28 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     caption = update.message.caption or ""
 
-    if not state.get("format"):
-        state["_pending_tema"] = caption or "Transforme este PDF em conteúdo para Instagram"
-        state["_pending_pdf"] = bytes(pdf_bytes)
-        keyboard = [
-            [
-                InlineKeyboardButton("📸 Post", callback_data="fmt_post"),
-                InlineKeyboardButton("🎠 Carrossel", callback_data="fmt_carrossel"),
-                InlineKeyboardButton("🎬 Reels", callback_data="fmt_reels"),
-            ]
-        ]
-        brand_name = BRANDS.get(state["brand"], {}).get("name", "✨ Personalizada")
-        await update.message.reply_text(
-            f"📄 *PDF recebido!* ({doc.file_name})\nMarca: {brand_name}\n\n🎯 Qual formato?",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=ParseMode.MARKDOWN
-        )
-        state["waiting_for"] = "_pending"
-        return
+    state["_pending_tema"] = caption or "Transforme este PDF em conteúdo para Instagram"
+    state["_pending_pdf"] = bytes(pdf_bytes)
+    state["waiting_for"] = "_pending"
 
-    tema = caption or "Transforme este PDF em conteúdo para Instagram"
-    await gerar_conteudo(update, tema, state, pdf_data=bytes(pdf_bytes))
+    brand_name = BRANDS.get(state["brand"], {}).get("name", "✨ Personalizada")
+    keyboard = [
+        [
+            InlineKeyboardButton("📸 Post", callback_data="fmt_post"),
+            InlineKeyboardButton("🎠 Carrossel", callback_data="fmt_carrossel"),
+            InlineKeyboardButton("🎬 Reels", callback_data="fmt_reels"),
+        ]
+    ]
+    await update.message.reply_text(
+        f"📄 *PDF recebido!* ({doc.file_name})\nMarca: {brand_name}\n\n🎯 Qual formato?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 
 # ─── GENERATE ───
 
 async def gerar_conteudo(update: Update, tema: str, state: dict, images=None, pdf_data=None):
-    """Core generation function"""
-    # Resolve pending data
     if images is None:
         images = state.pop("_pending_images", None)
     if pdf_data is None:
@@ -422,21 +452,19 @@ async def gerar_conteudo(update: Update, tema: str, state: dict, images=None, pd
     brand = state.get("brand", "llsquad")
     custom_brand = state.get("custom_brand", "")
 
-    # Get message object
     msg = update.message or update.callback_query.message
     brand_name = BRANDS.get(brand, {}).get("name", "✨ Personalizada")
     fmt_label = FORMAT_LABELS.get(fmt, "Post")
 
-    # Typing indicator
     await msg.reply_chat_action(ChatAction.TYPING)
 
     status = await msg.reply_text(
-        f"⚡ *Gerando {fmt_label}...*\nMarca: {brand_name}\n\n_Catarina está trabalhando..._",
+        f"⚡ *Gerando {fmt_label}...*\nMarca: {brand_name}\n\n_Catarina trabalhando..._",
         parse_mode=ParseMode.MARKDOWN
     )
 
     try:
-        result = await call_catarina(
+        result = call_catarina(
             user_message=f"Tema: \"{tema}\"\nFormato: {fmt_label}\n\nGere o conteúdo completo.",
             brand_key=brand,
             format_key=fmt,
@@ -445,49 +473,45 @@ async def gerar_conteudo(update: Update, tema: str, state: dict, images=None, pd
             pdf_data=pdf_data
         )
 
-        # Delete status message
         await status.delete()
 
-        # Split long messages (Telegram limit: 4096 chars)
         if len(result) <= 4000:
-            await msg.reply_text(result, parse_mode=ParseMode.MARKDOWN)
+            try:
+                await msg.reply_text(result, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                await msg.reply_text(result)
         else:
-            # Split by sections
-            chunks = split_message(result, 4000)
-            for chunk in chunks:
+            for chunk in split_message(result, 4000):
                 try:
                     await msg.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
                 except Exception:
-                    # Fallback without markdown if parsing fails
                     await msg.reply_text(chunk)
 
-        # Quick actions after generation
         keyboard = [
             [
                 InlineKeyboardButton("🔄 Outro tema", callback_data=f"fmt_{fmt}"),
                 InlineKeyboardButton("🎯 Outro formato", callback_data="show_formats"),
             ],
-            [
-                InlineKeyboardButton("🎨 Trocar marca", callback_data="show_brands"),
-            ]
+            [InlineKeyboardButton("🎨 Trocar marca", callback_data="show_brands")],
         ]
         await msg.reply_text(
-            "✅ *Conteúdo gerado!* O que quer fazer agora?",
+            "✅ *Pronto!* O que quer fazer agora?",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.MARKDOWN
         )
 
     except Exception as e:
-        logger.error(f"Error generating content: {e}")
-        await status.edit_text(f"❌ *Erro ao gerar:*\n`{str(e)[:200]}`", parse_mode=ParseMode.MARKDOWN)
+        logger.error(f"Error: {e}")
+        await status.edit_text(
+            f"❌ *Erro:*\n`{str(e)[:300]}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
 
-    # Reset state
     state["format"] = None
     state["waiting_for"] = None
 
 
 def split_message(text, max_len=4000):
-    """Split long text into chunks respecting line breaks"""
     chunks = []
     current = ""
     for line in text.split("\n"):
@@ -499,44 +523,6 @@ def split_message(text, max_len=4000):
     if current:
         chunks.append(current)
     return chunks
-
-
-# ─── EXTENDED CALLBACKS ───
-
-async def extended_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    state = get_state(user_id)
-    data = query.data
-
-    if data == "show_formats":
-        keyboard = [
-            [InlineKeyboardButton("📸 Post", callback_data="fmt_post")],
-            [InlineKeyboardButton("🎠 Carrossel", callback_data="fmt_carrossel")],
-            [InlineKeyboardButton("🎬 Reels", callback_data="fmt_reels")],
-        ]
-        await query.edit_message_text("🎯 *Qual formato?*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-
-    elif data == "show_brands":
-        keyboard = [
-            [InlineKeyboardButton("🏋️ LL Squad", callback_data="brand_llsquad")],
-            [InlineKeyboardButton("🏛️ Melliz Arquitetura", callback_data="brand_melliz")],
-            [InlineKeyboardButton("✨ Outra marca", callback_data="brand_custom")],
-        ]
-        await query.edit_message_text("🎨 *Escolha a marca:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-
-    elif data.startswith("brand_") or data.startswith("fmt_"):
-        await button_callback(update, context)
-
-        # If selecting format and there's pending tema, generate
-        if data.startswith("fmt_") and state.get("waiting_for") == "_pending":
-            fmt = data.replace("fmt_", "")
-            state["format"] = fmt
-            pending_tema = state.pop("_pending_tema", "")
-            if pending_tema:
-                state["waiting_for"] = None
-                await gerar_conteudo(update, pending_tema, state)
 
 
 # ─── MAIN ───
@@ -551,7 +537,6 @@ def main():
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ajuda", ajuda))
     app.add_handler(CommandHandler("help", ajuda))
@@ -561,16 +546,10 @@ def main():
     app.add_handler(CommandHandler("carrossel", cmd_direto))
     app.add_handler(CommandHandler("reels", cmd_direto))
 
-    # Callbacks (buttons)
-    app.add_handler(CallbackQueryHandler(extended_callback))
+    app.add_handler(CallbackQueryHandler(button_callback))
 
-    # Photos
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-
-    # Documents (PDF)
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
-
-    # Text messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("🤖 Catarina bot started!")
